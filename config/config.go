@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -54,7 +55,8 @@ func Load() (*Config, error) {
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
-		return value
+		// Trim whitespace to prevent issues with .env file formatting
+		return strings.TrimSpace(value)
 	}
 	return defaultValue
 }

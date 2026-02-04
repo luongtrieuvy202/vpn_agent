@@ -67,9 +67,27 @@ func (m *Manager) ApplyLimit(peerIP string, speedLimitMbps int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check if rule already exists
+	// If rule already exists, remove it first (idempotent operation)
 	if _, exists := m.rules[peerIP]; exists {
-		return fmt.Errorf("traffic control rule already exists for %s", peerIP)
+		// Remove existing rule before applying new one
+		rule := m.rules[peerIP]
+		
+		// Remove filter
+		cmd := exec.Command("tc", "filter", "del",
+			"dev", m.interfaceName,
+			"protocol", "ip",
+			"parent", "1:0",
+			"prio", "1",
+			"u32", "match", "ip", "dst", peerIP+"/32",
+			"flowid", rule.ClassID)
+		_ = cmd.Run() // Ignore error if filter doesn't exist
+
+		// Remove class
+		cmd = exec.Command("tc", "class", "del", "dev", m.interfaceName, "classid", rule.ClassID)
+		_ = cmd.Run() // Ignore error if class doesn't exist
+
+		// Remove from map
+		delete(m.rules, peerIP)
 	}
 
 	// Generate class ID
