@@ -24,13 +24,33 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# Get script directory (where this script is located)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Find agent repository root (directory containing go.mod)
+# This works whether the repo is named vpn_agent, agent, or anything else
+find_repo_root() {
+    local dir="$SCRIPT_DIR"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/go.mod" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    # If not found, fall back to script directory
+    echo "$SCRIPT_DIR"
+}
+
+AGENT_SOURCE_DIR="$(find_repo_root)"
+
 # Configuration variables
 WG_INTERFACE="wg0"
 WG_PORT="51820"
 AGENT_PORT="8080"
 SUBNET_CIDR="10.0.0.0/24"
 SERVER_IP="10.0.0.1"
-AGENT_DIR="/opt/vpn-agent"
+AGENT_DIR="/opt/vpn-agent"      # Installation directory for built agent
 AGENT_CONFIG_DIR="/etc/vpn-agent"
 WG_DIR="/etc/wireguard"
 
@@ -226,31 +246,36 @@ EOF
     # Step 5: Set up VPN Agent
     print_header "Step 5: Setting Up VPN Agent"
     
-    # Check if agent code exists
-    if [ ! -d "$AGENT_DIR" ]; then
-        print_warning "Agent directory not found: $AGENT_DIR"
-        print_info "Please provide the path to the agent source code"
-        get_input "Agent source code path" "" AGENT_SOURCE_PATH
-        
-        if [ -z "$AGENT_SOURCE_PATH" ] || [ ! -d "$AGENT_SOURCE_PATH" ]; then
-            print_error "Agent source code not found. Please clone or copy the agent code first."
-            print_info "You can:"
-            print_info "  1. Clone the repository: git clone <repo-url> $AGENT_DIR"
-            print_info "  2. Copy agent files to $AGENT_DIR"
-            print_info "  3. Re-run this script"
-            exit 1
-        fi
-        
-        mkdir -p "$AGENT_DIR"
-        cp -r "$AGENT_SOURCE_PATH"/* "$AGENT_DIR/"
+    # Verify agent source code exists (find repo root by looking for go.mod)
+    print_step "Locating agent source code..."
+    print_info "Script location: $SCRIPT_DIR"
+    
+    # Re-detect repo root in case script was moved
+    AGENT_SOURCE_DIR="$(find_repo_root)"
+    
+    if [ ! -f "$AGENT_SOURCE_DIR/go.mod" ]; then
+        print_error "Agent repository not found (go.mod missing)"
+        print_error "Searched from: $SCRIPT_DIR"
+        print_error "Expected go.mod at: $AGENT_SOURCE_DIR/go.mod"
+        print_info "This script should be run from within the vpn_agent repository."
+        print_info "The repository can be cloned as: git clone <repo-url> vpn_agent"
+        exit 1
     fi
     
-    # Build agent
+    print_success "Agent repository found at: $AGENT_SOURCE_DIR"
+    if [ "$AGENT_SOURCE_DIR" != "$SCRIPT_DIR" ]; then
+        print_info "Script is in subdirectory, using repository root"
+    fi
+    
+    # Create installation directory
+    mkdir -p "$AGENT_DIR"
+    
+    # Build agent from source directory
     print_step "Building VPN agent..."
-    cd "$AGENT_DIR/agent"
+    cd "$AGENT_SOURCE_DIR"
     
     if [ ! -f "go.mod" ]; then
-        print_error "go.mod not found. Is this the correct agent directory?"
+        print_error "go.mod not found in $AGENT_SOURCE_DIR"
         exit 1
     fi
     
@@ -330,27 +355,47 @@ EOF
     systemctl enable vpn-agent > /dev/null 2>&1
     print_success "Systemd service created"
     
-    # Step 6: Configure firewall
+    # Step 6: Configure firewall (never lock out SSH or block agent)
     print_header "Step 6: Configuring Firewall"
     
     print_step "Configuring UFW firewall..."
     
-    # Allow WireGuard
-    ufw allow ${WG_PORT}/udp comment 'WireGuard' > /dev/null 2>&1
+    # Set explicit defaults so behavior is predictable (deny incoming, allow outgoing)
+    ufw default deny incoming > /dev/null 2>&1
+    ufw default allow outgoing > /dev/null 2>&1
     
-    # Allow agent API from backend
+    # 1) Always allow SSH first - never enable UFW without this (avoids lockout)
+    ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1
+    print_success "SSH (22/tcp) allowed"
+    
+    # 2) WireGuard
+    ufw allow ${WG_PORT}/udp comment 'WireGuard' > /dev/null 2>&1
+    print_success "WireGuard (${WG_PORT}/udp) allowed"
+    
+    # 3) Agent API: from backend IP only, or from anywhere if not set (backend must reach agent)
     if [ -n "$BACKEND_IP" ]; then
         ufw allow from "$BACKEND_IP" to any port ${AGENT_PORT} comment 'VPN Agent API' > /dev/null 2>&1
-        print_success "Agent API access allowed from $BACKEND_IP"
+        print_success "Agent API (${AGENT_PORT}/tcp) allowed from $BACKEND_IP only"
     else
-        print_warning "Backend IP not provided, agent API will be accessible from anywhere"
-        print_warning "Consider restricting access manually: ufw allow from <backend-ip> to any port $AGENT_PORT"
+        ufw allow ${AGENT_PORT}/tcp comment 'VPN Agent API' > /dev/null 2>&1
+        print_success "Agent API (${AGENT_PORT}/tcp) allowed (restrict later with: ufw allow from <backend-ip> to any port $AGENT_PORT)"
     fi
     
-    # Enable firewall (non-interactive)
-    ufw --force enable > /dev/null 2>&1
-    
-    print_success "Firewall configured"
+    # Safety: confirm before enabling so user sees what is allowed
+    echo ""
+    echo -e "${CYAN}UFW will be enabled with these incoming rules:${NC}"
+    echo -e "  • SSH (22/tcp)"
+    echo -e "  • WireGuard (${WG_PORT}/udp)"
+    echo -e "  • Agent API (${AGENT_PORT}/tcp)"
+    echo ""
+    read -p "$(echo -e ${YELLOW}Enable UFW now? [Y/n]${NC}): " ufw_confirm
+    if [[ "$ufw_confirm" =~ ^[Nn]$ ]]; then
+        print_warning "UFW not enabled. Enable manually when ready: sudo ufw enable"
+    else
+        ufw --force enable > /dev/null 2>&1
+        print_success "Firewall enabled"
+    fi
+    print_info "Verify anytime with: sudo ufw status"
     
     # Step 7: Start services
     print_header "Step 7: Starting Services"
