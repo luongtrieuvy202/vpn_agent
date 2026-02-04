@@ -31,7 +31,19 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	_ = godotenv.Load()
+	// Try loading .env from common locations
+	envPaths := []string{
+		"/etc/vpn-agent/.env",  // Systemd service location
+		".env",                  // Current directory
+		"../.env",               // Parent directory
+	}
+	
+	for _, path := range envPaths {
+		if err := godotenv.Load(path); err == nil {
+			break // Successfully loaded
+		}
+	}
+	// Continue even if .env not found - environment variables might be set by systemd
 
 	config := &Config{
 		ServerPort:           getEnv("PORT", "8080"),

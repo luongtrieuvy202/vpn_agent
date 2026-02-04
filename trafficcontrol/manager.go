@@ -40,24 +40,51 @@ func NewManager(interfaceName, ifbInterface string) (*Manager, error) {
 func (m *Manager) initializeRootQdisc() error {
 	// Check if root qdisc exists
 	cmd := exec.Command("tc", "qdisc", "show", "dev", m.interfaceName)
-	if err := cmd.Run(); err == nil {
-		// Qdisc exists, check if it's HTB
-		output, _ := cmd.Output()
-		if contains(string(output), "htb") {
-			return nil // Already initialized
+	output, err := cmd.Output()
+	qdiscExists := err == nil && len(output) > 0
+	
+	if qdiscExists {
+		outputStr := string(output)
+		// Check if it's already HTB
+		if contains(outputStr, "htb") {
+			// Check if root class also exists
+			classCmd := exec.Command("tc", "class", "show", "dev", m.interfaceName, "classid", "1:1")
+			if classCmd.Run() == nil {
+				return nil // Already fully initialized
+			}
+			// HTB exists but root class missing, we'll create it below
+		} else {
+			// Different qdisc exists, remove it first
+			delCmd := exec.Command("tc", "qdisc", "del", "dev", m.interfaceName, "root")
+			if delErr := delCmd.Run(); delErr != nil {
+				// If deletion fails, try to force replace
+				replaceCmd := exec.Command("tc", "qdisc", "replace", "dev", m.interfaceName, "root", "handle", "1:", "htb", "default", "30")
+				if replaceErr := replaceCmd.Run(); replaceErr != nil {
+					return fmt.Errorf("failed to remove existing qdisc and replace: %w", replaceErr)
+				}
+				// Successfully replaced, now create root class below
+			}
 		}
 	}
 
-	// Create root qdisc
-	cmd = exec.Command("tc", "qdisc", "add", "dev", m.interfaceName, "root", "handle", "1:", "htb", "default", "30")
+	// Create root qdisc (use replace which works whether qdisc exists or not)
+	cmd = exec.Command("tc", "qdisc", "replace", "dev", m.interfaceName, "root", "handle", "1:", "htb", "default", "30")
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create root qdisc: %w", err)
+		// If replace fails, try add (in case no qdisc exists at all)
+		addCmd := exec.Command("tc", "qdisc", "add", "dev", m.interfaceName, "root", "handle", "1:", "htb", "default", "30")
+		if addErr := addCmd.Run(); addErr != nil {
+			return fmt.Errorf("failed to create root qdisc: replace error: %v, add error: %v", err, addErr)
+		}
 	}
 
-	// Create root class (10 Gbps default)
-	cmd = exec.Command("tc", "class", "add", "dev", m.interfaceName, "parent", "1:", "classid", "1:1", "htb", "rate", "10000mbit")
+	// Create root class (10 Gbps default) - use replace to handle existing class
+	cmd = exec.Command("tc", "class", "replace", "dev", m.interfaceName, "parent", "1:", "classid", "1:1", "htb", "rate", "10000mbit")
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create root class: %w", err)
+		// If replace fails, try add (in case class doesn't exist)
+		addCmd := exec.Command("tc", "class", "add", "dev", m.interfaceName, "parent", "1:", "classid", "1:1", "htb", "rate", "10000mbit")
+		if addErr := addCmd.Run(); addErr != nil {
+			return fmt.Errorf("failed to create root class: replace error: %v, add error: %v", err, addErr)
+		}
 	}
 
 	return nil
