@@ -2,7 +2,9 @@ package trafficcontrol
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
+	"strconv"
 	"sync"
 )
 
@@ -90,46 +92,65 @@ func (m *Manager) initializeRootQdisc() error {
 	return nil
 }
 
+// classIDForPeer returns a deterministic class ID for a peer IP (e.g. 10.0.0.2 -> "1:2").
+// Uses last octet for 10.x.x.x IPs to avoid collisions after agent restart.
+func classIDForPeer(peerIP string) (string, error) {
+	ip := net.ParseIP(peerIP)
+	if ip == nil {
+		return "", fmt.Errorf("invalid peer IP: %s", peerIP)
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return "", fmt.Errorf("peer IP must be IPv4: %s", peerIP)
+	}
+	// Use last octet; 0 and 1 are reserved (network/gateway), so 2-254
+	last := int(ip4[3])
+	if last < 2 || last > 254 {
+		return "", fmt.Errorf("peer IP last octet must be 2-254: %s", peerIP)
+	}
+	return fmt.Sprintf("1:%d", last), nil
+}
+
 func (m *Manager) ApplyLimit(peerIP string, speedLimitMbps int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// If rule already exists, remove it first (idempotent operation)
-	if _, exists := m.rules[peerIP]; exists {
-		// Remove existing rule before applying new one
-		rule := m.rules[peerIP]
-		
-		// Remove filter
-		cmd := exec.Command("tc", "filter", "del",
+	classID, err := classIDForPeer(peerIP)
+	if err != nil {
+		return err
+	}
+
+	// If we have this peer in our map, remove old filter first (idempotent)
+	if rule, exists := m.rules[peerIP]; exists {
+		exec.Command("tc", "filter", "del",
 			"dev", m.interfaceName,
 			"protocol", "ip",
 			"parent", "1:0",
 			"prio", "1",
 			"u32", "match", "ip", "dst", peerIP+"/32",
-			"flowid", rule.ClassID)
-		_ = cmd.Run() // Ignore error if filter doesn't exist
-
-		// Remove class
-		cmd = exec.Command("tc", "class", "del", "dev", m.interfaceName, "classid", rule.ClassID)
-		_ = cmd.Run() // Ignore error if class doesn't exist
-
-		// Remove from map
+			"flowid", rule.ClassID).Run()
+		exec.Command("tc", "class", "del", "dev", m.interfaceName, "classid", rule.ClassID).Run()
 		delete(m.rules, peerIP)
 	}
 
-	// Generate class ID
-	classID := fmt.Sprintf("1:%d", m.nextClassID)
-	m.nextClassID++
-
-	// Create class
-	cmd := exec.Command("tc", "class", "add",
+	// Create or replace class (replace handles existing class after agent restart)
+	cmd := exec.Command("tc", "class", "replace",
 		"dev", m.interfaceName,
 		"parent", "1:1",
 		"classid", classID,
 		"htb", "rate", fmt.Sprintf("%dmbit", speedLimitMbps),
 		"ceil", fmt.Sprintf("%dmbit", speedLimitMbps))
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create class: %w", err)
+		// If replace fails, try add (e.g. first time for this peer)
+		addCmd := exec.Command("tc", "class", "add",
+			"dev", m.interfaceName,
+			"parent", "1:1",
+			"classid", classID,
+			"htb", "rate", fmt.Sprintf("%dmbit", speedLimitMbps),
+			"ceil", fmt.Sprintf("%dmbit", speedLimitMbps))
+		if addErr := addCmd.Run(); addErr != nil {
+			return fmt.Errorf("failed to create class: %w (replace: %v, add: %v)", err, err, addErr)
+		}
 	}
 
 	// Add filter for egress (outgoing)
