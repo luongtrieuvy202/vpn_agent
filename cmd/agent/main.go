@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
-
-	"net"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/vpnplatform/agent/config"
@@ -14,7 +18,7 @@ import (
 )
 
 func main() {
-	// Load configuration
+	// Load configuration (API_KEY can be empty if using self-registration)
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -26,6 +30,14 @@ func main() {
 		log.Fatalf("Failed to initialize WireGuard manager: %v", err)
 	}
 	defer wgManager.Close()
+
+	// Self-register with backend if we have no ServerID yet (saves server_id + api_key for next start)
+	if cfg.ServerID == "" && cfg.BackendURL != "" && cfg.RegistrationSecret != "" {
+		if err := registerWithBackend(cfg, wgManager); err != nil {
+			log.Fatalf("Self-registration failed: %v", err)
+		}
+		log.Printf("Registered with backend: server_id=%s", cfg.ServerID)
+	}
 
 	// Initialize Traffic Control manager
 	tcManager, err := trafficcontrol.NewManager(cfg.WireGuardInterface, cfg.IFBInterface)
@@ -199,6 +211,11 @@ func main() {
 		})
 	}
 
+	// Start usage push to backend when backend cannot reach this agent (e.g. behind NAT)
+	if cfg.BackendURL != "" && cfg.ServerID != "" {
+		go runUsagePusher(cfg, wgManager)
+	}
+
 	// Start server
 	addr := cfg.ServerHost + ":" + cfg.ServerPort
 	log.Printf("VPN Agent starting on %s", addr)
@@ -208,10 +225,129 @@ func main() {
 	}
 }
 
+func runUsagePusher(cfg *config.Config, wgManager *wireguard.Manager) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		peers, err := wgManager.ListPeers()
+		if err != nil {
+			log.Printf("[Usage push] ListPeers: %v", err)
+			continue
+		}
+		payload := struct {
+			ServerID string `json:"server_id"`
+			APIKey   string `json:"api_key"`
+			Peers    []struct {
+				PublicKey     string `json:"public_key"`
+				BytesReceived int64  `json:"bytes_received"`
+				BytesSent     int64  `json:"bytes_sent"`
+			} `json:"peers"`
+		}{
+			ServerID: cfg.ServerID,
+			APIKey:   cfg.APIKey,
+			Peers:    make([]struct {
+				PublicKey     string `json:"public_key"`
+				BytesReceived int64  `json:"bytes_received"`
+				BytesSent     int64  `json:"bytes_sent"`
+			}, 0, len(peers)),
+		}
+		for _, p := range peers {
+			payload.Peers = append(payload.Peers, struct {
+				PublicKey     string `json:"public_key"`
+				BytesReceived int64  `json:"bytes_received"`
+				BytesSent     int64  `json:"bytes_sent"`
+			}{
+				PublicKey:     p.PublicKey.String(),
+				BytesReceived: p.ReceiveBytes,
+				BytesSent:     p.TransmitBytes,
+			})
+		}
+		if len(payload.Peers) == 0 {
+			continue
+		}
+		body, _ := json.Marshal(payload)
+		url := strings.TrimSuffix(cfg.BackendURL, "/") + "/api/v1/agents/usage/report"
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("[Usage push] POST %s: %v", url, err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("[Usage push] POST %s: status %d", url, resp.StatusCode)
+		}
+	}
+}
+
 func parseCIDR(cidr string) (*net.IPNet, error) {
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, err
 	}
 	return ipNet, nil
+}
+
+func registerWithBackend(cfg *config.Config, wgManager *wireguard.Manager) error {
+	publicKey, listenPort, err := wgManager.DeviceInfo()
+	if err != nil {
+		return err
+	}
+	subnet := cfg.SubnetCIDR
+	if subnet == "" {
+		subnet = "10.0.0.0/24"
+	}
+	body := struct {
+		RegistrationSecret string `json:"registration_secret"`
+		PublicKey          string `json:"public_key"`
+		WireguardPort      int    `json:"wireguard_port"`
+		SubnetCIDR         string `json:"subnet_cidr"`
+	}{
+		RegistrationSecret: cfg.RegistrationSecret,
+		PublicKey:           publicKey,
+		WireguardPort:       listenPort,
+		SubnetCIDR:          subnet,
+	}
+	raw, _ := json.Marshal(body)
+	url := strings.TrimSuffix(cfg.BackendURL, "/") + "/api/v1/agents/register"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		var errBody struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		if errBody.Error != "" {
+			return fmt.Errorf("backend returned %d: %s", resp.StatusCode, errBody.Error)
+		}
+		return fmt.Errorf("backend returned %d", resp.StatusCode)
+	}
+	var result struct {
+		ServerID   string `json:"server_id"`
+		AgentAPIKey string `json:"agent_api_key"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+	if result.ServerID == "" || result.AgentAPIKey == "" {
+		return fmt.Errorf("backend did not return server_id and agent_api_key")
+	}
+	if err := config.SaveRegistrationState(result.ServerID, result.AgentAPIKey); err != nil {
+		return fmt.Errorf("saving registration state: %w", err)
+	}
+	cfg.ServerID = result.ServerID
+	cfg.APIKey = result.AgentAPIKey
+	return nil
 }

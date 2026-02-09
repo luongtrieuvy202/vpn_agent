@@ -314,6 +314,14 @@ HOST=0.0.0.0
 # Traffic control settings
 TC_ENABLED=true
 TC_TOTAL_CAPACITY_MBPS=10000
+
+# --- Minimal setup (least steps): set only BACKEND_URL and REGISTRATION_SECRET (same as backend env).
+#    Leave API_KEY and SERVER_ID unset. Start the agent once; it will self-register and save credentials.
+# BACKEND_URL=https://your-api.example.com
+# REGISTRATION_SECRET=your-secret-from-backend-env
+
+# Optional manual setup: add server in dashboard, then set SERVER_ID and BACKEND_URL for usage push.
+# SERVER_ID=uuid-from-dashboard
 EOF
     
     chmod 600 "${AGENT_CONFIG_DIR}/.env"
@@ -379,6 +387,15 @@ EOF
     else
         ufw allow ${AGENT_PORT}/tcp comment 'VPN Agent API' > /dev/null 2>&1
         print_success "Agent API (${AGENT_PORT}/tcp) allowed (restrict later with: ufw allow from <backend-ip> to any port $AGENT_PORT)"
+    fi
+    
+    # 4) Allow forwarding for WireGuard (so VPN client traffic can reach the internet)
+    if ! grep -q "ufw-before-forward.*wg0" /etc/ufw/before.rules 2>/dev/null; then
+        echo "" >> /etc/ufw/before.rules
+        echo "# Allow forward for WireGuard (VPN traffic to internet)" >> /etc/ufw/before.rules
+        echo "-A ufw-before-forward -i $WG_INTERFACE -j ACCEPT" >> /etc/ufw/before.rules
+        echo "-A ufw-before-forward -o $WG_INTERFACE -j ACCEPT" >> /etc/ufw/before.rules
+        print_success "UFW forward rules for WireGuard added"
     fi
     
     # Safety: confirm before enabling so user sees what is allowed

@@ -110,3 +110,12 @@ func (m *Manager) InterfaceExists() bool {
 	_, err := m.client.Device(m.interfaceName)
 	return err == nil
 }
+
+// DeviceInfo returns the WireGuard device's public key and listen port (for agent self-registration).
+func (m *Manager) DeviceInfo() (publicKey string, listenPort int, err error) {
+	dev, err := m.client.Device(m.interfaceName)
+	if err != nil {
+		return "", 0, err
+	}
+	return dev.PublicKey.String(), dev.ListenPort, nil
+}
