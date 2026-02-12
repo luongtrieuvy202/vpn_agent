@@ -18,50 +18,84 @@ import (
 )
 
 func main() {
+	log.Printf("[Agent] Starting VPN Agent...")
+	
 	// Load configuration (API_KEY can be empty if using self-registration)
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("[Agent] Failed to load config: %v", err)
 	}
+	log.Printf("[Agent] Configuration loaded: BackendURL=%s, WGInterface=%s, Port=%s", 
+		cfg.BackendURL, cfg.WireGuardInterface, cfg.ServerPort)
 
 	// Initialize WireGuard manager
+	log.Printf("[Agent] Initializing WireGuard manager for interface: %s", cfg.WireGuardInterface)
 	wgManager, err := wireguard.NewManager(cfg.WireGuardInterface)
 	if err != nil {
-		log.Fatalf("Failed to initialize WireGuard manager: %v", err)
+		log.Fatalf("[Agent] Failed to initialize WireGuard manager: %v", err)
 	}
 	defer wgManager.Close()
+	log.Printf("[Agent] WireGuard manager initialized successfully")
 
 	// Self-register with backend if we have no ServerID yet (saves server_id + api_key for next start)
 	if cfg.ServerID == "" && cfg.BackendURL != "" && cfg.RegistrationSecret != "" {
+		log.Printf("[Agent] No ServerID found, attempting self-registration with backend...")
+		log.Printf("[Agent] Registration details: BackendURL=%s, RegistrationSecret=%s", 
+			cfg.BackendURL, func() string {
+				if cfg.RegistrationSecret != "" {
+					return "***SET***"
+				}
+				return "NOT SET"
+			}())
 		if err := registerWithBackend(cfg, wgManager); err != nil {
-			log.Fatalf("Self-registration failed: %v", err)
+			log.Fatalf("[Agent] Self-registration failed: %v", err)
 		}
-		log.Printf("Registered with backend: server_id=%s", cfg.ServerID)
+		log.Printf("[Agent] Successfully registered with backend: server_id=%s, api_key=%s", 
+			cfg.ServerID, func() string {
+				if cfg.APIKey != "" {
+					return cfg.APIKey[:8] + "..." // Show first 8 chars only
+				}
+				return "NOT SET"
+			}())
+	} else if cfg.ServerID != "" {
+		log.Printf("[Agent] Using existing registration: server_id=%s", cfg.ServerID)
+	} else {
+		log.Printf("[Agent] No registration configured - BackendURL=%v, RegistrationSecret=%v", 
+			cfg.BackendURL != "", cfg.RegistrationSecret != "")
 	}
 
 	// Initialize Traffic Control manager
+	log.Printf("[Agent] Initializing Traffic Control manager (enabled=%v, capacity=%d Mbps)...", 
+		cfg.TrafficControlEnabled, cfg.TotalCapacityMbps)
 	tcManager, err := trafficcontrol.NewManager(cfg.WireGuardInterface, cfg.IFBInterface)
 	if err != nil {
-		log.Fatalf("Failed to initialize Traffic Control manager: %v", err)
+		log.Fatalf("[Agent] Failed to initialize Traffic Control manager: %v", err)
 	}
+	log.Printf("[Agent] Traffic Control manager initialized successfully")
 
 	// Set Gin mode
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
+	log.Printf("[Agent] HTTP router initialized")
 
 	// API Key middleware
 	apiKeyMiddleware := func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" || apiKey != cfg.APIKey {
+			log.Printf("[API] Unauthorized request from %s: %s %s (missing or invalid API key)", 
+				c.ClientIP(), c.Request.Method, c.Request.URL.Path)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid API key"})
 			c.Abort()
 			return
 		}
+		log.Printf("[API] Authenticated request: %s %s from %s", 
+			c.Request.Method, c.Request.URL.Path, c.ClientIP())
 		c.Next()
 	}
 
 	// Health check
 	r.GET("/health", func(c *gin.Context) {
+		log.Printf("[Health] Health check requested from %s", c.ClientIP())
 		exists := wgManager.InterfaceExists()
 		c.JSON(http.StatusOK, gin.H{
 			"status": "healthy",
@@ -84,23 +118,31 @@ func main() {
 				AllowedIPs string `json:"allowed_ips"`
 			}
 			if err := c.ShouldBindJSON(&req); err != nil {
+				log.Printf("[Peer] Failed to parse add peer request: %v", err)
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
 
+			log.Printf("[Peer] Adding peer: PublicKey=%s, AssignedIP=%s", 
+				req.PublicKey[:16]+"...", req.AssignedIP)
+
 			// Parse IP
 			ipNet, err := parseCIDR(req.AssignedIP)
 			if err != nil {
+				log.Printf("[Peer] Invalid assigned_ip: %s", req.AssignedIP)
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid assigned_ip"})
 				return
 			}
 
 			// Add peer
 			if err := wgManager.AddPeer(req.PublicKey, []net.IPNet{*ipNet}); err != nil {
+				log.Printf("[Peer] ERROR: Failed to add peer: %v", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
+			log.Printf("[Peer] Successfully added peer: PublicKey=%s, AssignedIP=%s", 
+				req.PublicKey[:16]+"...", req.AssignedIP)
 			c.JSON(http.StatusOK, gin.H{
 				"success": true,
 				"peer": gin.H{
@@ -213,27 +255,36 @@ func main() {
 
 	// Start usage push to backend when backend cannot reach this agent (e.g. behind NAT)
 	if cfg.BackendURL != "" && cfg.ServerID != "" {
+		log.Printf("[Agent] Starting usage pusher (BackendURL=%s, ServerID=%s)", 
+			cfg.BackendURL, cfg.ServerID)
 		go runUsagePusher(cfg, wgManager)
+	} else {
+		log.Printf("[Agent] Usage pusher disabled (BackendURL=%v, ServerID=%v)", 
+			cfg.BackendURL != "", cfg.ServerID != "")
 	}
 
 	// Start server
 	addr := cfg.ServerHost + ":" + cfg.ServerPort
-	log.Printf("VPN Agent starting on %s", addr)
+	log.Printf("[Agent] VPN Agent starting HTTP server on %s", addr)
+	log.Printf("[Agent] Server ready to accept connections")
 	if err := r.Run(addr); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+		log.Fatalf("[Agent] Failed to start server: %v", err)
 		os.Exit(1)
 	}
 }
 
 func runUsagePusher(cfg *config.Config, wgManager *wireguard.Manager) {
+	log.Printf("[UsagePusher] Starting usage pusher (interval: 30s)")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		log.Printf("[UsagePusher] Collecting peer usage statistics...")
 		peers, err := wgManager.ListPeers()
 		if err != nil {
-			log.Printf("[Usage push] ListPeers: %v", err)
+			log.Printf("[UsagePusher] ERROR: Failed to list peers: %v", err)
 			continue
 		}
+		log.Printf("[UsagePusher] Found %d active peers", len(peers))
 		payload := struct {
 			ServerID string `json:"server_id"`
 			APIKey   string `json:"api_key"`
@@ -267,19 +318,23 @@ func runUsagePusher(cfg *config.Config, wgManager *wireguard.Manager) {
 		}
 		body, _ := json.Marshal(payload)
 		url := strings.TrimSuffix(cfg.BackendURL, "/") + "/api/v1/agents/usage/report"
+		log.Printf("[UsagePusher] Sending usage report to: %s (peers: %d)", url, len(payload.Peers))
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
+			log.Printf("[UsagePusher] ERROR: Failed to create request: %v", err)
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("[Usage push] POST %s: %v", url, err)
+			log.Printf("[UsagePusher] ERROR: Failed to send usage report: %v", err)
 			continue
 		}
-		resp.Body.Close()
+		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("[Usage push] POST %s: status %d", url, resp.StatusCode)
+			log.Printf("[UsagePusher] WARNING: Backend returned status %d", resp.StatusCode)
+		} else {
+			log.Printf("[UsagePusher] Successfully sent usage report for %d peers", len(payload.Peers))
 		}
 	}
 }
@@ -293,14 +348,26 @@ func parseCIDR(cidr string) (*net.IPNet, error) {
 }
 
 func registerWithBackend(cfg *config.Config, wgManager *wireguard.Manager) error {
+	log.Printf("[Registration] Starting registration process...")
+	
+	// Get WireGuard device info
+	log.Printf("[Registration] Getting WireGuard device information...")
 	publicKey, listenPort, err := wgManager.DeviceInfo()
 	if err != nil {
-		return err
+		log.Printf("[Registration] ERROR: Failed to get WireGuard device info: %v", err)
+		return fmt.Errorf("failed to get WireGuard device info: %w", err)
 	}
+	log.Printf("[Registration] WireGuard info: PublicKey=%s, ListenPort=%d", publicKey, listenPort)
+	
 	subnet := cfg.SubnetCIDR
 	if subnet == "" {
 		subnet = "10.0.0.0/24"
+		log.Printf("[Registration] Using default subnet: %s", subnet)
+	} else {
+		log.Printf("[Registration] Using configured subnet: %s", subnet)
 	}
+	
+	// Prepare registration request
 	body := struct {
 		RegistrationSecret string `json:"registration_secret"`
 		PublicKey          string `json:"public_key"`
@@ -312,42 +379,84 @@ func registerWithBackend(cfg *config.Config, wgManager *wireguard.Manager) error
 		WireguardPort:       listenPort,
 		SubnetCIDR:          subnet,
 	}
-	raw, _ := json.Marshal(body)
+	
+	raw, err := json.Marshal(body)
+	if err != nil {
+		log.Printf("[Registration] ERROR: Failed to marshal registration request: %v", err)
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	
 	url := strings.TrimSuffix(cfg.BackendURL, "/") + "/api/v1/agents/register"
+	log.Printf("[Registration] Sending registration request to: %s", url)
+	log.Printf("[Registration] Request payload: PublicKey=%s, WireguardPort=%d, SubnetCIDR=%s", 
+		publicKey, listenPort, subnet)
+	
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		log.Printf("[Registration] ERROR: Failed to create HTTP request: %v", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	
+	// Send request
+	log.Printf("[Registration] Sending POST request to backend...")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		log.Printf("[Registration] ERROR: Failed to send request to backend: %v", err)
+		log.Printf("[Registration] Check if backend is reachable at: %s", cfg.BackendURL)
+		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
 	defer resp.Body.Close()
+	
+	log.Printf("[Registration] Backend responded with status: %d", resp.StatusCode)
+	
 	if resp.StatusCode != http.StatusCreated {
 		var errBody struct {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&errBody)
 		if errBody.Error != "" {
+			log.Printf("[Registration] ERROR: Backend returned error: %s", errBody.Error)
 			return fmt.Errorf("backend returned %d: %s", resp.StatusCode, errBody.Error)
 		}
+		log.Printf("[Registration] ERROR: Backend returned status %d (no error message)", resp.StatusCode)
 		return fmt.Errorf("backend returned %d", resp.StatusCode)
 	}
+	
+	log.Printf("[Registration] Registration successful! Parsing response...")
 	var result struct {
 		ServerID   string `json:"server_id"`
 		AgentAPIKey string `json:"agent_api_key"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
+		log.Printf("[Registration] ERROR: Failed to decode response: %v", err)
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
+	
 	if result.ServerID == "" || result.AgentAPIKey == "" {
+		log.Printf("[Registration] ERROR: Backend response missing required fields: ServerID=%v, AgentAPIKey=%v", 
+			result.ServerID != "", result.AgentAPIKey != "")
 		return fmt.Errorf("backend did not return server_id and agent_api_key")
 	}
+	
+	log.Printf("[Registration] Received: ServerID=%s, AgentAPIKey=%s...", 
+		result.ServerID, func() string {
+			if len(result.AgentAPIKey) > 8 {
+				return result.AgentAPIKey[:8]
+			}
+			return result.AgentAPIKey
+		}())
+	
+	log.Printf("[Registration] Saving registration state to disk...")
 	if err := config.SaveRegistrationState(result.ServerID, result.AgentAPIKey); err != nil {
+		log.Printf("[Registration] ERROR: Failed to save registration state: %v", err)
 		return fmt.Errorf("saving registration state: %w", err)
 	}
+	log.Printf("[Registration] Registration state saved successfully")
+	
 	cfg.ServerID = result.ServerID
 	cfg.APIKey = result.AgentAPIKey
+	
+	log.Printf("[Registration] Registration completed successfully!")
 	return nil
 }

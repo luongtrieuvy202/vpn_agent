@@ -375,6 +375,9 @@ EOF
     # 1) Always allow SSH first - never enable UFW without this (avoids lockout)
     ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1
     print_success "SSH (22/tcp) allowed"
+    # Allow SSH from VPN subnet too (so SSH still works when you connect via WireGuard client)
+    ufw allow from ${SUBNET_CIDR} to any port 22 proto tcp comment 'SSH from VPN' > /dev/null 2>&1
+    print_success "SSH from VPN subnet (${SUBNET_CIDR}) allowed"
     
     # 2) WireGuard
     ufw allow ${WG_PORT}/udp comment 'WireGuard' > /dev/null 2>&1
