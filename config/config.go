@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -39,6 +40,10 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
+	// Get current working directory for logging
+	wd, _ := os.Getwd()
+	log.Printf("[Config] Current working directory: %s", wd)
+	
 	// Try loading .env from common locations
 	envPaths := []string{
 		"/etc/vpn-agent/.env",  // Systemd service location
@@ -46,10 +51,20 @@ func Load() (*Config, error) {
 		"../.env",               // Parent directory
 	}
 	
+	envLoaded := false
 	for _, path := range envPaths {
 		if err := godotenv.Load(path); err == nil {
+			log.Printf("[Config] Successfully loaded .env file from: %s", path)
+			envLoaded = true
 			break // Successfully loaded
+		} else {
+			log.Printf("[Config] Failed to load .env from %s: %v", path, err)
 		}
+	}
+	
+	if !envLoaded {
+		log.Printf("[Config] No .env file found in any of the checked locations")
+		log.Printf("[Config] Will use environment variables if set, or defaults")
 	}
 	// Continue even if .env not found - environment variables might be set by systemd
 
@@ -71,6 +86,35 @@ func Load() (*Config, error) {
 
 	// Load persisted registration (server_id + api_key) if present
 	loadRegistrationState(config)
+
+	// Log loaded configuration (sensitive values masked)
+	log.Printf("[Config] Loaded configuration:")
+	log.Printf("[Config]   BackendURL: %s", func() string {
+		if config.BackendURL != "" {
+			return config.BackendURL
+		}
+		return "(not set)"
+	}())
+	log.Printf("[Config]   RegistrationSecret: %s", func() string {
+		if config.RegistrationSecret != "" {
+			return "***SET***"
+		}
+		return "(not set)"
+	}())
+	log.Printf("[Config]   ServerID: %s", func() string {
+		if config.ServerID != "" {
+			return config.ServerID
+		}
+		return "(not set)"
+	}())
+	log.Printf("[Config]   APIKey: %s", func() string {
+		if config.APIKey != "" {
+			return config.APIKey[:min(8, len(config.APIKey))] + "..."
+		}
+		return "(not set)"
+	}())
+	log.Printf("[Config]   WGInterface: %s", config.WireGuardInterface)
+	log.Printf("[Config]   Port: %s", config.ServerPort)
 
 	// Either we have API_KEY (and optionally SERVER_ID), or we will self-register
 	if config.APIKey == "" && (config.RegistrationSecret == "" || config.BackendURL == "") {
@@ -149,4 +193,11 @@ func getEnvAsBool(key string, defaultValue bool) bool {
 		return value == "true" || value == "1" || value == "yes"
 	}
 	return defaultValue
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
