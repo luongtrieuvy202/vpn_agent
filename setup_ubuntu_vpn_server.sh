@@ -34,23 +34,6 @@ NC='\033[0m' # No Color
 # Get script directory (where this script is located)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Find agent repository root (directory containing go.mod)
-# This works whether the repo is named vpn_agent, agent, or anything else
-find_repo_root() {
-    local dir="$SCRIPT_DIR"
-    while [ "$dir" != "/" ]; do
-        if [ -f "$dir/go.mod" ]; then
-            echo "$dir"
-            return 0
-        fi
-        dir="$(dirname "$dir")"
-    done
-    # If not found, fall back to script directory
-    echo "$SCRIPT_DIR"
-}
-
-AGENT_SOURCE_DIR="$(find_repo_root)"
-
 # Configuration variables
 WG_INTERFACE="wg0"
 WG_PORT="51820"
@@ -160,20 +143,14 @@ main() {
     print_info "Detected network interface: $NET_INTERFACE"
     get_input "Network interface for NAT" "$NET_INTERFACE" NET_INTERFACE
     
-    # Step 1: Update system
-    print_header "Step 1: Updating System"
+    # Step 1: Update system and install dependencies
+    print_header "Step 1: Installing Dependencies"
     print_step "Updating package list..."
     apt update -qq
     print_success "Package list updated"
     
-    print_step "Upgrading system packages..."
-    apt upgrade -y -qq
-    print_success "System upgraded"
-    
-    # Step 2: Install dependencies
-    print_header "Step 2: Installing Dependencies"
     print_step "Installing git, WireGuard and tools..."
-    apt install -y git wireguard wireguard-tools iptables iproute2 curl wget ufw > /dev/null 2>&1
+    apt install -y git wireguard wireguard-tools iptables iproute2 curl wget ufw openssl > /dev/null 2>&1
     print_success "Dependencies installed"
     
     print_step "Installing Go..."
@@ -190,17 +167,21 @@ main() {
         print_info "Go already installed: $(go version)"
     fi
     
-    # Step 3: Enable IP forwarding
-    print_header "Step 3: Configuring Network"
+    # Step 2: Configure IP forwarding (required for VPN)
+    print_header "Step 2: Configuring Network"
     print_step "Enabling IP forwarding..."
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+    # Enable immediately
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    # Make it persistent
+    if ! grep -q "^net.ipv4.ip_forward" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    else
+        sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
     fi
-    sysctl -p > /dev/null
-    print_success "IP forwarding enabled"
+    print_success "IP forwarding enabled (net.ipv4.ip_forward=1)"
     
-    # Step 4: Set up WireGuard
-    print_header "Step 4: Setting Up WireGuard"
+    # Step 3: Set up WireGuard
+    print_header "Step 3: Setting Up WireGuard"
     
     print_step "Generating WireGuard keys..."
     mkdir -p "$WG_DIR"
@@ -254,69 +235,38 @@ EOF
         exit 1
     fi
     
-    # Step 5: Set up VPN Agent
-    print_header "Step 5: Setting Up VPN Agent"
+    # Step 4: Set up VPN Agent
+    print_header "Step 4: Setting Up VPN Agent"
     
-    # Clone or locate agent repository
-    print_step "Locating/cloning agent repository..."
-    
+    # Clone agent repository from GitHub
+    print_step "Cloning agent repository from GitHub..."
     AGENT_REPO_URL="https://github.com/luongtrieuvy202/vpn_agent.git"
     AGENT_REPO_DIR="/opt/vpn-agent-source"
     
-    # Check if we're already in a git repo
-    if [ -d "$SCRIPT_DIR/.git" ] && [ -f "$SCRIPT_DIR/go.mod" ]; then
-        AGENT_SOURCE_DIR="$SCRIPT_DIR"
-        print_success "Using existing repository at: $AGENT_SOURCE_DIR"
-    elif [ -d "$AGENT_REPO_DIR" ] && [ -f "$AGENT_REPO_DIR/go.mod" ]; then
-        AGENT_SOURCE_DIR="$AGENT_REPO_DIR"
-        print_success "Using existing cloned repository at: $AGENT_SOURCE_DIR"
-        print_step "Updating repository..."
-        cd "$AGENT_SOURCE_DIR"
-        git pull > /dev/null 2>&1 || print_warning "Failed to update repository (continuing anyway)"
-    else
-        print_step "Cloning agent repository from GitHub..."
-        mkdir -p "$(dirname $AGENT_REPO_DIR)"
-        if [ -d "$AGENT_REPO_DIR" ]; then
-            rm -rf "$AGENT_REPO_DIR"
-        fi
-        if git clone "$AGENT_REPO_URL" "$AGENT_REPO_DIR" 2>&1; then
-            if [ -f "$AGENT_REPO_DIR/go.mod" ]; then
-                AGENT_SOURCE_DIR="$AGENT_REPO_DIR"
-                print_success "Repository cloned to: $AGENT_SOURCE_DIR"
-            else
-                print_error "Repository cloned but go.mod not found"
-                exit 1
-            fi
+    # Remove existing directory if present
+    if [ -d "$AGENT_REPO_DIR" ]; then
+        rm -rf "$AGENT_REPO_DIR"
+    fi
+    
+    mkdir -p "$(dirname $AGENT_REPO_DIR)"
+    if git clone "$AGENT_REPO_URL" "$AGENT_REPO_DIR" 2>&1; then
+        if [ -f "$AGENT_REPO_DIR/go.mod" ]; then
+            AGENT_SOURCE_DIR="$AGENT_REPO_DIR"
+            print_success "Repository cloned to: $AGENT_SOURCE_DIR"
         else
-            print_error "Failed to clone repository from $AGENT_REPO_URL"
-            print_error "Please ensure:"
-            print_error "  - Git is installed"
-            print_error "  - You have internet access"
-            print_error "  - The repository URL is correct: $AGENT_REPO_URL"
+            print_error "Repository cloned but go.mod not found"
             exit 1
         fi
-    fi
-    
-    if [ ! -f "$AGENT_SOURCE_DIR/go.mod" ]; then
-        print_error "Agent repository not found (go.mod missing)"
-        print_error "Expected go.mod at: $AGENT_SOURCE_DIR/go.mod"
+    else
+        print_error "Failed to clone repository from $AGENT_REPO_URL"
+        print_error "Please ensure git is installed and you have internet access"
         exit 1
     fi
     
-    print_success "Agent repository ready at: $AGENT_SOURCE_DIR"
-    
-    # Create installation directory
-    mkdir -p "$AGENT_DIR"
-    
-    # Build agent from source directory
+    # Build agent
     print_step "Building VPN agent..."
+    mkdir -p "$AGENT_DIR"
     cd "$AGENT_SOURCE_DIR"
-    
-    if [ ! -f "go.mod" ]; then
-        print_error "go.mod not found in $AGENT_SOURCE_DIR"
-        exit 1
-    fi
-    
     go mod download
     go build -o "$AGENT_DIR/vpn-agent" ./cmd/agent
     
@@ -418,19 +368,21 @@ EOF
     systemctl enable vpn-agent > /dev/null 2>&1
     print_success "Systemd service created"
     
-    # Step 6: Configure firewall (never lock out SSH or block agent)
-    print_header "Step 6: Configuring Firewall"
+    # Step 5: Configure firewall (CRITICAL: SSH must be allowed first!)
+    print_header "Step 5: Configuring Firewall"
     
     print_step "Configuring UFW firewall..."
     
-    # Set explicit defaults so behavior is predictable (deny incoming, allow outgoing)
+    # CRITICAL: Always allow SSH FIRST before any other firewall operations
+    # This prevents lockout if UFW is already enabled
+    ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1
+    print_success "SSH (22/tcp) allowed - this ensures you won't be locked out"
+    
+    # Set explicit defaults (deny incoming, allow outgoing)
     ufw default deny incoming > /dev/null 2>&1
     ufw default allow outgoing > /dev/null 2>&1
     
-    # 1) Always allow SSH first - never enable UFW without this (avoids lockout)
-    ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1
-    print_success "SSH (22/tcp) allowed"
-    # Allow SSH from VPN subnet too (so SSH still works when you connect via WireGuard client)
+    # Allow SSH from VPN subnet too (so SSH works when connected via WireGuard)
     ufw allow from ${SUBNET_CIDR} to any port 22 proto tcp comment 'SSH from VPN' > /dev/null 2>&1
     print_success "SSH from VPN subnet (${SUBNET_CIDR}) allowed"
     
@@ -472,8 +424,8 @@ EOF
     fi
     print_info "Verify anytime with: sudo ufw status"
     
-    # Step 7: Start services
-    print_header "Step 7: Starting Services"
+    # Step 6: Start services
+    print_header "Step 6: Starting Services"
     
     print_step "Starting VPN agent..."
     systemctl start vpn-agent
@@ -487,8 +439,8 @@ EOF
         exit 1
     fi
     
-    # Step 8: Verify setup
-    print_header "Step 8: Verifying Setup"
+    # Step 7: Verify setup
+    print_header "Step 7: Verifying Setup"
     
     print_step "Checking WireGuard..."
     if wg show "$WG_INTERFACE" > /dev/null 2>&1; then
@@ -506,69 +458,6 @@ EOF
         print_error "VPN agent is not responding"
         print_info "Check logs: journalctl -u vpn-agent -n 50"
     fi
-    
-    # Step 9: Generate database SQL
-    print_header "Step 9: Database Registration"
-    
-    print_step "Generating database registration SQL..."
-    
-    SQL_FILE="/tmp/register_server.sql"
-    cat > "$SQL_FILE" <<EOF
--- Register VPN Server in Database
--- Run this SQL in your PostgreSQL database
-
-INSERT INTO servers (
-    name,
-    region,
-    public_ip,
-    wireguard_port,
-    public_key,
-    endpoint,
-    subnet_cidr,
-    max_peers,
-    status,
-    agent_url,
-    agent_api_key
-) VALUES (
-    '$SERVER_NAME',
-    '$REGION',
-    '$SERVER_PUBLIC_IP',
-    $WG_PORT,
-    '$WG_PUBLIC_KEY',
-    '$SERVER_PUBLIC_IP:$WG_PORT',
-    '$SUBNET_CIDR',
-    $MAX_PEERS,
-    'active',
-    'http://$SERVER_PUBLIC_IP:$AGENT_PORT',
-    '$AGENT_API_KEY'
-)
-RETURNING server_id;
-
--- After inserting, get the server_id and run:
--- (Replace SERVER_ID with the actual UUID returned above)
-
--- Initialize IP pool
-INSERT INTO ip_allocations (server_id, assigned_ip, status)
-SELECT 
-    'SERVER_ID_HERE'::uuid,
-    ('10.0.0.' || generate_series(2, 254)::text)::inet,
-    'free'
-ON CONFLICT DO NOTHING;
-
--- Verify
-SELECT 
-    server_id,
-    name,
-    region,
-    status,
-    current_peers,
-    max_peers
-FROM servers 
-WHERE name = '$SERVER_NAME';
-EOF
-    
-    print_success "SQL script generated: $SQL_FILE"
-    print_info "Copy this file to your database server and execute it"
     
     # Create summary
     print_header "Setup Complete!"
@@ -596,7 +485,6 @@ EOF
     echo -e "  • Agent config: ${AGENT_CONFIG_DIR}/.env"
     echo -e "  • Public key: /tmp/wg_public_key.txt"
     echo -e "  • API key: /tmp/agent_api_key.txt"
-    echo -e "  • SQL script: $SQL_FILE"
     echo ""
     echo -e "${CYAN}Next Steps:${NC}"
     if [ -n "$BACKEND_URL" ] && [ -n "$REGISTRATION_SECRET" ]; then
@@ -607,12 +495,8 @@ EOF
     else
         echo -e "  1. Edit ${AGENT_CONFIG_DIR}/.env and add BACKEND_URL and REGISTRATION_SECRET"
         echo -e "  2. Restart agent: ${YELLOW}systemctl restart vpn-agent${NC}"
-        echo -e "  OR manually register using SQL script:"
-        echo -e "  3. Copy $SQL_FILE to your database server"
-        echo -e "  4. Execute the SQL to register the server"
-        echo -e "  5. Initialize the IP pool (see SQL script)"
     fi
-    echo -e "  6. Test connection from backend"
+    echo -e "  3. Test connection from backend"
     echo ""
     echo -e "${CYAN}Useful Commands:${NC}"
     echo -e "  • Check WireGuard: ${YELLOW}wg show $WG_INTERFACE${NC}"

@@ -67,14 +67,23 @@ func main() {
 			cfg.BackendURL != "", cfg.RegistrationSecret != "")
 	}
 
-	// Initialize Traffic Control manager
-	log.Printf("[Agent] Initializing Traffic Control manager (enabled=%v, capacity=%d Mbps)...", 
-		cfg.TrafficControlEnabled, cfg.TotalCapacityMbps)
-	tcManager, err := trafficcontrol.NewManager(cfg.WireGuardInterface, cfg.IFBInterface)
-	if err != nil {
-		log.Fatalf("[Agent] Failed to initialize Traffic Control manager: %v", err)
+	// Initialize Traffic Control manager (only if enabled)
+	var tcManager *trafficcontrol.Manager
+	if cfg.TrafficControlEnabled {
+		log.Printf("[Agent] Initializing Traffic Control manager (enabled=%v, capacity=%d Mbps)...", 
+			cfg.TrafficControlEnabled, cfg.TotalCapacityMbps)
+		tcManager, err = trafficcontrol.NewManager(cfg.WireGuardInterface, cfg.IFBInterface)
+		if err != nil {
+			log.Printf("[Agent] WARNING: Failed to initialize Traffic Control manager: %v", err)
+			log.Printf("[Agent] WARNING: Traffic limiting will be disabled. VPN will still work but without bandwidth limits.")
+			log.Printf("[Agent] WARNING: To fix: ensure interface %s is up and supports HTB qdisc", cfg.WireGuardInterface)
+			tcManager = nil // Continue without TC
+		} else {
+			log.Printf("[Agent] Traffic Control manager initialized successfully")
+		}
+	} else {
+		log.Printf("[Agent] Traffic Control disabled in configuration")
 	}
-	log.Printf("[Agent] Traffic Control manager initialized successfully")
 
 	// Set Gin mode
 	gin.SetMode(gin.ReleaseMode)
@@ -220,6 +229,11 @@ func main() {
 
 		// Traffic Control
 		api.POST("/traffic-control", func(c *gin.Context) {
+			if tcManager == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "traffic control is not available"})
+				return
+			}
+
 			var req struct {
 				PeerIP        string `json:"peer_ip" binding:"required"`
 				SpeedLimitMbps int   `json:"speed_limit_mbps" binding:"required"`
@@ -244,6 +258,11 @@ func main() {
 		})
 
 		api.DELETE("/traffic-control/:peer_ip", func(c *gin.Context) {
+			if tcManager == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "traffic control is not available"})
+				return
+			}
+
 			peerIP := c.Param("peer_ip")
 			if err := tcManager.RemoveLimit(peerIP); err != nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
