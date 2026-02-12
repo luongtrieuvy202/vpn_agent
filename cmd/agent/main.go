@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -263,13 +266,48 @@ func main() {
 			cfg.BackendURL != "", cfg.ServerID != "")
 	}
 
-	// Start server
+	// Start server with graceful shutdown
 	addr := cfg.ServerHost + ":" + cfg.ServerPort
 	log.Printf("[Agent] VPN Agent starting HTTP server on %s", addr)
 	log.Printf("[Agent] Server ready to accept connections")
-	if err := r.Run(addr); err != nil {
-		log.Fatalf("[Agent] Failed to start server: %v", err)
-		os.Exit(1)
+
+	// Create HTTP server with timeout settings
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
+	}
+
+	// Start server in a goroutine
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[Agent] Failed to start server: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal to gracefully shutdown the server
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	log.Printf("[Agent] Received signal: %v, initiating graceful shutdown...", sig)
+
+	// Unregister from backend before shutting down
+	if cfg.ServerID != "" && cfg.APIKey != "" && cfg.BackendURL != "" {
+		log.Printf("[Agent] Unregistering from backend...")
+		if err := unregisterFromBackend(cfg); err != nil {
+			log.Printf("[Agent] WARNING: Failed to unregister from backend: %v", err)
+		} else {
+			log.Printf("[Agent] Successfully unregistered from backend")
+		}
+	}
+
+	// Give server 5 seconds to finish handling requests
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[Agent] Server forced to shutdown: %v", err)
+	} else {
+		log.Printf("[Agent] Server gracefully stopped")
 	}
 }
 
@@ -458,5 +496,61 @@ func registerWithBackend(cfg *config.Config, wgManager *wireguard.Manager) error
 	cfg.APIKey = result.AgentAPIKey
 	
 	log.Printf("[Registration] Registration completed successfully!")
+	return nil
+}
+
+func unregisterFromBackend(cfg *config.Config) error {
+	if cfg.BackendURL == "" || cfg.ServerID == "" || cfg.APIKey == "" {
+		return fmt.Errorf("missing required configuration for unregistration")
+	}
+
+	log.Printf("[Unregister] Unregistering server from backend...")
+	log.Printf("[Unregister] ServerID: %s, BackendURL: %s", cfg.ServerID, cfg.BackendURL)
+
+	body := struct {
+		ServerID string `json:"server_id"`
+		APIKey   string `json:"api_key"`
+	}{
+		ServerID: cfg.ServerID,
+		APIKey:   cfg.APIKey,
+	}
+
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := strings.TrimSuffix(cfg.BackendURL, "/") + "/api/v1/agents/unregister"
+	log.Printf("[Unregister] Sending unregister request to: %s", url)
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Use a short timeout for unregistration
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to backend: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		if errBody.Error != "" {
+			return fmt.Errorf("backend returned %d: %s", resp.StatusCode, errBody.Error)
+		}
+		return fmt.Errorf("backend returned %d", resp.StatusCode)
+	}
+
+	log.Printf("[Unregister] Successfully unregistered from backend")
 	return nil
 }
