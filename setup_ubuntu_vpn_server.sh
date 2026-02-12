@@ -6,12 +6,19 @@
 # This script automates the setup of an Ubuntu server as a VPN node for the
 # VPN management platform.
 #
+# The script will:
+# - Install git, WireGuard, Go, and other dependencies
+# - Clone the VPN agent repository from GitHub
+# - Configure WireGuard and build the VPN agent
+# - Set up auto-registration with backend (if BACKEND_URL and REGISTRATION_SECRET provided)
+#
 # Usage: sudo ./setup_ubuntu_vpn_server.sh
 #
 # Requirements:
 # - Ubuntu 20.04 or higher
 # - Root or sudo access
 # - Internet connection
+# - GitHub repository: https://github.com/luongtrieuvy202/vpn_agent.git
 ###############################################################################
 
 set -e  # Exit on error
@@ -121,11 +128,13 @@ main() {
     print_header "Ubuntu VPN Server Setup"
     
     echo -e "This script will:"
-    echo -e "  1. Install required packages (WireGuard, Go, etc.)"
-    echo -e "  2. Configure WireGuard"
-    echo -e "  3. Install and configure VPN Agent"
-    echo -e "  4. Set up systemd services"
-    echo -e "  5. Configure firewall"
+    echo -e "  1. Install required packages (git, WireGuard, Go, etc.)"
+    echo -e "  2. Clone VPN agent repository from GitHub"
+    echo -e "  3. Configure WireGuard"
+    echo -e "  4. Build and install VPN Agent"
+    echo -e "  5. Configure agent with backend URL and registration secret"
+    echo -e "  6. Set up systemd services"
+    echo -e "  7. Configure firewall"
     echo -e ""
     
     read -p "$(echo -e ${YELLOW}Continue? [y/N]${NC}): " confirm
@@ -140,7 +149,9 @@ main() {
     get_input "Server public IP address" "" SERVER_PUBLIC_IP
     get_input "Region (e.g., us-east, eu-west)" "us-east" REGION
     get_input "Server name" "Ubuntu VPN Server" SERVER_NAME
-    get_input "Backend API IP (for firewall)" "" BACKEND_IP
+    get_input "Backend API URL (e.g., http://api.example.com:8080)" "" BACKEND_URL
+    get_input "Registration Secret (must match backend REGISTRATION_SECRET)" "" REGISTRATION_SECRET
+    get_input "Backend API IP (for firewall, optional)" "" BACKEND_IP
     get_input "Max peers" "100" MAX_PEERS
     get_input "Subnet CIDR" "$SUBNET_CIDR" SUBNET_CIDR
     
@@ -161,9 +172,9 @@ main() {
     
     # Step 2: Install dependencies
     print_header "Step 2: Installing Dependencies"
-    print_step "Installing WireGuard and tools..."
-    apt install -y wireguard wireguard-tools iptables iproute2 curl wget ufw > /dev/null 2>&1
-    print_success "WireGuard installed"
+    print_step "Installing git, WireGuard and tools..."
+    apt install -y git wireguard wireguard-tools iptables iproute2 curl wget ufw > /dev/null 2>&1
+    print_success "Dependencies installed"
     
     print_step "Installing Go..."
     if ! command -v go &> /dev/null; then
@@ -246,26 +257,53 @@ EOF
     # Step 5: Set up VPN Agent
     print_header "Step 5: Setting Up VPN Agent"
     
-    # Verify agent source code exists (find repo root by looking for go.mod)
-    print_step "Locating agent source code..."
-    print_info "Script location: $SCRIPT_DIR"
+    # Clone or locate agent repository
+    print_step "Locating/cloning agent repository..."
     
-    # Re-detect repo root in case script was moved
-    AGENT_SOURCE_DIR="$(find_repo_root)"
+    AGENT_REPO_URL="https://github.com/luongtrieuvy202/vpn_agent.git"
+    AGENT_REPO_DIR="/opt/vpn-agent-source"
+    
+    # Check if we're already in a git repo
+    if [ -d "$SCRIPT_DIR/.git" ] && [ -f "$SCRIPT_DIR/go.mod" ]; then
+        AGENT_SOURCE_DIR="$SCRIPT_DIR"
+        print_success "Using existing repository at: $AGENT_SOURCE_DIR"
+    elif [ -d "$AGENT_REPO_DIR" ] && [ -f "$AGENT_REPO_DIR/go.mod" ]; then
+        AGENT_SOURCE_DIR="$AGENT_REPO_DIR"
+        print_success "Using existing cloned repository at: $AGENT_SOURCE_DIR"
+        print_step "Updating repository..."
+        cd "$AGENT_SOURCE_DIR"
+        git pull > /dev/null 2>&1 || print_warning "Failed to update repository (continuing anyway)"
+    else
+        print_step "Cloning agent repository from GitHub..."
+        mkdir -p "$(dirname $AGENT_REPO_DIR)"
+        if [ -d "$AGENT_REPO_DIR" ]; then
+            rm -rf "$AGENT_REPO_DIR"
+        fi
+        if git clone "$AGENT_REPO_URL" "$AGENT_REPO_DIR" 2>&1; then
+            if [ -f "$AGENT_REPO_DIR/go.mod" ]; then
+                AGENT_SOURCE_DIR="$AGENT_REPO_DIR"
+                print_success "Repository cloned to: $AGENT_SOURCE_DIR"
+            else
+                print_error "Repository cloned but go.mod not found"
+                exit 1
+            fi
+        else
+            print_error "Failed to clone repository from $AGENT_REPO_URL"
+            print_error "Please ensure:"
+            print_error "  - Git is installed"
+            print_error "  - You have internet access"
+            print_error "  - The repository URL is correct: $AGENT_REPO_URL"
+            exit 1
+        fi
+    fi
     
     if [ ! -f "$AGENT_SOURCE_DIR/go.mod" ]; then
         print_error "Agent repository not found (go.mod missing)"
-        print_error "Searched from: $SCRIPT_DIR"
         print_error "Expected go.mod at: $AGENT_SOURCE_DIR/go.mod"
-        print_info "This script should be run from within the vpn_agent repository."
-        print_info "The repository can be cloned as: git clone <repo-url> vpn_agent"
         exit 1
     fi
     
-    print_success "Agent repository found at: $AGENT_SOURCE_DIR"
-    if [ "$AGENT_SOURCE_DIR" != "$SCRIPT_DIR" ]; then
-        print_info "Script is in subdirectory, using repository root"
-    fi
+    print_success "Agent repository ready at: $AGENT_SOURCE_DIR"
     
     # Create installation directory
     mkdir -p "$AGENT_DIR"
@@ -300,12 +338,21 @@ EOF
     print_step "Creating agent configuration..."
     mkdir -p "$AGENT_CONFIG_DIR"
     
+    # Build .env file with user-provided values
     cat > "${AGENT_CONFIG_DIR}/.env" <<EOF
-# Agent API Key
+# Backend Configuration (for auto-registration)
+BACKEND_URL=${BACKEND_URL:-}
+REGISTRATION_SECRET=${REGISTRATION_SECRET:-}
+
+# Agent API Key (will be set after auto-registration)
 API_KEY=$AGENT_API_KEY
+
+# Server ID (will be set after auto-registration)
+SERVER_ID=
 
 # WireGuard interface
 WG_INTERFACE=$WG_INTERFACE
+SUBNET_CIDR=$SUBNET_CIDR
 
 # Agent server settings
 PORT=$AGENT_PORT
@@ -314,15 +361,23 @@ HOST=0.0.0.0
 # Traffic control settings
 TC_ENABLED=true
 TC_TOTAL_CAPACITY_MBPS=10000
+IFB_INTERFACE=ifb0
 
-# --- Minimal setup (least steps): set only BACKEND_URL and REGISTRATION_SECRET (same as backend env).
-#    Leave API_KEY and SERVER_ID unset. Start the agent once; it will self-register and save credentials.
-# BACKEND_URL=https://your-api.example.com
-# REGISTRATION_SECRET=your-secret-from-backend-env
-
-# Optional manual setup: add server in dashboard, then set SERVER_ID and BACKEND_URL for usage push.
-# SERVER_ID=uuid-from-dashboard
+# Logging
+LOG_LEVEL=info
 EOF
+    
+    # If BACKEND_URL and REGISTRATION_SECRET are provided, agent will auto-register
+    if [ -n "$BACKEND_URL" ] && [ -n "$REGISTRATION_SECRET" ]; then
+        print_success "Backend configuration set - agent will auto-register on first start"
+        print_info "Backend URL: $BACKEND_URL"
+    else
+        print_warning "BACKEND_URL or REGISTRATION_SECRET not set"
+        print_info "Agent will not auto-register. You can:"
+        print_info "  1. Edit ${AGENT_CONFIG_DIR}/.env and add BACKEND_URL and REGISTRATION_SECRET"
+        print_info "  2. Restart the agent: systemctl restart vpn-agent"
+        print_info "  3. Or manually register the server using the SQL script"
+    fi
     
     chmod 600 "${AGENT_CONFIG_DIR}/.env"
     print_success "Agent configuration created"
@@ -529,6 +584,12 @@ EOF
     echo -e "  ${YELLOW}Agent URL:${NC} http://$SERVER_PUBLIC_IP:$AGENT_PORT"
     echo -e "  ${YELLOW}Server Public IP:${NC} $SERVER_PUBLIC_IP"
     echo -e "  ${YELLOW}Region:${NC} $REGION"
+    if [ -n "$BACKEND_URL" ]; then
+        echo -e "  ${YELLOW}Backend URL:${NC} $BACKEND_URL"
+    fi
+    if [ -n "$REGISTRATION_SECRET" ]; then
+        echo -e "  ${YELLOW}Registration Secret:${NC} ***SET***"
+    fi
     echo ""
     echo -e "${CYAN}Files Created:${NC}"
     echo -e "  • WireGuard config: ${WG_DIR}/${WG_INTERFACE}.conf"
@@ -538,10 +599,20 @@ EOF
     echo -e "  • SQL script: $SQL_FILE"
     echo ""
     echo -e "${CYAN}Next Steps:${NC}"
-    echo -e "  1. Copy $SQL_FILE to your database server"
-    echo -e "  2. Execute the SQL to register the server"
-    echo -e "  3. Initialize the IP pool (see SQL script)"
-    echo -e "  4. Test connection from backend"
+    if [ -n "$BACKEND_URL" ] && [ -n "$REGISTRATION_SECRET" ]; then
+        echo -e "  ${GREEN}✓${NC} Agent is configured for auto-registration"
+        echo -e "  ${GREEN}✓${NC} Agent will register automatically on first start"
+        echo -e "  1. Check agent logs to verify registration: ${YELLOW}journalctl -u vpn-agent -f${NC}"
+        echo -e "  2. Verify server appears in backend: ${YELLOW}curl $BACKEND_URL/api/v1/servers${NC}"
+    else
+        echo -e "  1. Edit ${AGENT_CONFIG_DIR}/.env and add BACKEND_URL and REGISTRATION_SECRET"
+        echo -e "  2. Restart agent: ${YELLOW}systemctl restart vpn-agent${NC}"
+        echo -e "  OR manually register using SQL script:"
+        echo -e "  3. Copy $SQL_FILE to your database server"
+        echo -e "  4. Execute the SQL to register the server"
+        echo -e "  5. Initialize the IP pool (see SQL script)"
+    fi
+    echo -e "  6. Test connection from backend"
     echo ""
     echo -e "${CYAN}Useful Commands:${NC}"
     echo -e "  • Check WireGuard: ${YELLOW}wg show $WG_INTERFACE${NC}"
