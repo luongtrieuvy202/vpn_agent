@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      # Unit tests only (tc/netlink paths require NET_ADMIN + a wg interface,
+      # so they're exercised on-node, not in CI).
+      - run: go test ./...

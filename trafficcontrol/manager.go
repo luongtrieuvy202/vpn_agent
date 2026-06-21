@@ -181,6 +181,15 @@ func (m *Manager) ApplyLimit(peerIP string, speedLimitMbps int) error {
 		}
 	}
 
+	// Record the rule BEFORE the filter so a partial failure is still cleanable
+	// (otherwise the class created above would orphan with no map entry).
+	m.rules[peerIP] = &TCRule{
+		ClassID:        classID,
+		PeerIP:         peerIP,
+		SpeedLimitMbps: speedLimitMbps,
+		Direction:      "both",
+	}
+
 	// Add filter for egress (outgoing)
 	cmd = exec.Command("tc", "filter", "add",
 		"dev", m.interfaceName,
@@ -190,17 +199,10 @@ func (m *Manager) ApplyLimit(peerIP string, speedLimitMbps int) error {
 		"u32", "match", "ip", "dst", peerIP+"/32",
 		"flowid", classID)
 	if err := cmd.Run(); err != nil {
-		// Cleanup class
+		// Roll back the class and the map entry together
 		exec.Command("tc", "class", "del", "dev", m.interfaceName, "classid", classID).Run()
+		delete(m.rules, peerIP)
 		return fmt.Errorf("failed to add filter: %w", err)
-	}
-
-	// Store rule
-	m.rules[peerIP] = &TCRule{
-		ClassID:       classID,
-		PeerIP:        peerIP,
-		SpeedLimitMbps: speedLimitMbps,
-		Direction:     "both",
 	}
 
 	return nil
@@ -212,7 +214,9 @@ func (m *Manager) RemoveLimit(peerIP string) error {
 
 	rule, exists := m.rules[peerIP]
 	if !exists {
-		return fmt.Errorf("traffic control rule not found for %s", peerIP)
+		// Idempotent: no rule to remove is success, not an error (peer-removal
+		// cleanup calls this unconditionally).
+		return nil
 	}
 
 	// Remove filter

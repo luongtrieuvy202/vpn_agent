@@ -3,6 +3,7 @@ package wireguard
 import (
 	"fmt"
 	"net"
+	"sync"
 
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -11,6 +12,9 @@ import (
 type Manager struct {
 	interfaceName string
 	client        *wgctrl.Client
+	// Serializes peer mutations. ConfigureDevice on the same interface from
+	// concurrent HTTP handlers can interleave/race; one writer at a time.
+	mu sync.Mutex
 }
 
 func NewManager(interfaceName string) (*Manager, error) {
@@ -40,6 +44,8 @@ func (m *Manager) AddPeer(publicKey string, allowedIPs []net.IPNet) error {
 		Peers: []wgtypes.PeerConfig{peer},
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.client.ConfigureDevice(m.interfaceName, config); err != nil {
 		return fmt.Errorf("failed to configure device: %w", err)
 	}
@@ -62,6 +68,8 @@ func (m *Manager) RemovePeer(publicKey string) error {
 		Peers: []wgtypes.PeerConfig{peer},
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.client.ConfigureDevice(m.interfaceName, config); err != nil {
 		return fmt.Errorf("failed to remove peer: %w", err)
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/vpnplatform/agent/config"
 	"github.com/vpnplatform/agent/trafficcontrol"
 	"github.com/vpnplatform/agent/wireguard"
@@ -90,11 +92,15 @@ func main() {
 	r := gin.Default()
 	log.Printf("[Agent] HTTP router initialized")
 
+	registerMetrics(wgManager, tcManager)
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
 	// API Key middleware
 	apiKeyMiddleware := func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
-		if apiKey == "" || apiKey != cfg.APIKey {
-			log.Printf("[API] Unauthorized request from %s: %s %s (missing or invalid API key)", 
+		// Constant-time compare to avoid leaking the key via response timing.
+		if cfg.APIKey == "" || subtle.ConstantTimeCompare([]byte(apiKey), []byte(cfg.APIKey)) != 1 {
+			log.Printf("[API] Unauthorized request from %s: %s %s (missing or invalid API key)",
 				c.ClientIP(), c.Request.Method, c.Request.URL.Path)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid API key"})
 			c.Abort()
@@ -135,26 +141,44 @@ func main() {
 				return
 			}
 
-			log.Printf("[Peer] Adding peer: PublicKey=%s, AssignedIP=%s", 
-				req.PublicKey[:16]+"...", req.AssignedIP)
+			log.Printf("[Peer] Adding peer: PublicKey=%s, AssignedIP=%s",
+				shortKey(req.PublicKey), req.AssignedIP)
 
-			// Parse IP
+			// Parse the assigned IP
 			ipNet, err := parseCIDR(req.AssignedIP)
 			if err != nil {
 				log.Printf("[Peer] Invalid assigned_ip: %s", req.AssignedIP)
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid assigned_ip"})
 				return
 			}
+			allowed := []net.IPNet{*ipNet}
+
+			// Validate optional allowed_ips (comma-separated CIDRs) before passing
+			// to the kernel, which would otherwise silently ignore bad entries.
+			if req.AllowedIPs != "" {
+				for _, cidr := range strings.Split(req.AllowedIPs, ",") {
+					cidr = strings.TrimSpace(cidr)
+					if cidr == "" {
+						continue
+					}
+					_, n, perr := net.ParseCIDR(cidr)
+					if perr != nil {
+						c.JSON(http.StatusBadRequest, gin.H{"error": "invalid allowed_ips: " + cidr})
+						return
+					}
+					allowed = append(allowed, *n)
+				}
+			}
 
 			// Add peer
-			if err := wgManager.AddPeer(req.PublicKey, []net.IPNet{*ipNet}); err != nil {
+			if err := wgManager.AddPeer(req.PublicKey, allowed); err != nil {
 				log.Printf("[Peer] ERROR: Failed to add peer: %v", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
-			log.Printf("[Peer] Successfully added peer: PublicKey=%s, AssignedIP=%s", 
-				req.PublicKey[:16]+"...", req.AssignedIP)
+			log.Printf("[Peer] Successfully added peer: PublicKey=%s, AssignedIP=%s",
+				shortKey(req.PublicKey), req.AssignedIP)
 			c.JSON(http.StatusOK, gin.H{
 				"success": true,
 				"peer": gin.H{
@@ -170,14 +194,29 @@ func main() {
 
 		api.DELETE("/peers/:public_key", func(c *gin.Context) {
 			publicKey := c.Param("public_key")
+
+			// Capture the peer's IPs before removal so we can also tear down its
+			// traffic-control rule — otherwise tc classes/filters orphan on the
+			// node (resource leak + bandwidth accounting drift).
+			var peerIPs []string
+			if peer, gerr := wgManager.GetPeer(publicKey); gerr == nil {
+				for _, n := range peer.AllowedIPs {
+					peerIPs = append(peerIPs, n.IP.String())
+				}
+			}
+
 			if err := wgManager.RemovePeer(publicKey); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
-			c.JSON(http.StatusOK, gin.H{
-				"success": true,
-			})
+			if tcManager != nil {
+				for _, ip := range peerIPs {
+					tcManager.RemoveLimit(ip) // idempotent; no-op if no rule
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"success": true})
 		})
 
 		api.GET("/peers/:public_key/stats", func(c *gin.Context) {
@@ -242,6 +281,12 @@ func main() {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
+			// Bound the rate: 0/negative produce invalid tc syntax; absurd values
+			// clobber the HTB tree. 1 Mbps–100 Gbps is the sane range.
+			if req.SpeedLimitMbps < 1 || req.SpeedLimitMbps > 100000 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "speed_limit_mbps must be between 1 and 100000"})
+				return
+			}
 
 			if err := tcManager.ApplyLimit(req.PeerIP, req.SpeedLimitMbps); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -290,10 +335,14 @@ func main() {
 	log.Printf("[Agent] VPN Agent starting HTTP server on %s", addr)
 	log.Printf("[Agent] Server ready to accept connections")
 
-	// Create HTTP server with timeout settings
+	// Create HTTP server with timeout settings (slowloris / hung-connection guard)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: r,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Start server in a goroutine
@@ -375,25 +424,63 @@ func runUsagePusher(cfg *config.Config, wgManager *wireguard.Manager) {
 		}
 		body, _ := json.Marshal(payload)
 		url := strings.TrimSuffix(cfg.BackendURL, "/") + "/api/v1/agents/usage/report"
-		log.Printf("[UsagePusher] Sending usage report to: %s (peers: %d)", url, len(payload.Peers))
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			log.Printf("[UsagePusher] ERROR: Failed to create request: %v", err)
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("[UsagePusher] ERROR: Failed to send usage report: %v", err)
-			continue
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("[UsagePusher] WARNING: Backend returned status %d", resp.StatusCode)
+
+		// Counters are CUMULATIVE (read from the kernel) and the backend computes
+		// deltas, so a missed cycle self-heals next time — we just retry transient
+		// failures within the cycle and always use a client timeout (the old code
+		// used http.DefaultClient with no timeout + a deferred Body.Close inside
+		// this infinite loop, which leaked connections and could hang forever).
+		if pushUsageWithRetry(url, body) {
+			metricUsagePushTotal.WithLabelValues("success").Inc()
+			log.Printf("[UsagePusher] Sent usage report for %d peers", len(payload.Peers))
 		} else {
-			log.Printf("[UsagePusher] Successfully sent usage report for %d peers", len(payload.Peers))
+			metricUsagePushTotal.WithLabelValues("error").Inc()
+			log.Printf("[UsagePusher] Failed after retries; next cycle resends cumulative totals")
 		}
 	}
+}
+
+var usagePushClient = &http.Client{Timeout: 10 * time.Second}
+
+func pushUsageWithRetry(url string, body []byte) bool {
+	delays := []time.Duration{0, 2 * time.Second, 5 * time.Second}
+	for attempt, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[UsagePusher] build request: %v", err)
+			return false
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := usagePushClient.Do(req)
+		if err != nil {
+			log.Printf("[UsagePusher] attempt %d failed: %v", attempt+1, err)
+			continue
+		}
+		status := resp.StatusCode
+		resp.Body.Close()
+		if status == http.StatusOK {
+			return true
+		}
+		if status >= 400 && status < 500 {
+			metricUsagePushTotal.WithLabelValues("http_error").Inc()
+			log.Printf("[UsagePusher] backend returned %d (not retrying)", status)
+			return false
+		}
+		log.Printf("[UsagePusher] attempt %d: backend returned %d", attempt+1, status)
+	}
+	return false
+}
+
+// shortKey safely truncates a WireGuard public key for logging.
+func shortKey(k string) string {
+	if len(k) > 16 {
+		return k[:16] + "..."
+	}
+	return k
 }
 
 func parseCIDR(cidr string) (*net.IPNet, error) {
